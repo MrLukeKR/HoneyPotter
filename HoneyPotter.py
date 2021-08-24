@@ -1,97 +1,261 @@
-#!/bin/python
-
-# AbuseIPDB Cateogries
-# --------------------
-# 1	    DNS Compromise	    Altering DNS records resulting in improper redirection.
-# 2	    DNS Poisoning	    Falsifying domain server cache (cache poisoning).
-# 3	    Fraud Orders	    Fraudulent orders.
-# 4	    DDoS Attack	        Participating in distributed denial-of-service (usually part of botnet).
-# 5	    FTP Brute-Force	
-# 6	    Ping of Death	    Oversized IP packet.
-# 7	    Phishing	        Phishing websites and/or email.
-# 8	    Fraud VoIP	
-# 9	    Open Proxy	        Open proxy, open relay, or Tor exit node.
-# 10	Web Spam	        Comment/forum spam, HTTP referer spam, or other CMS spam.
-# 11	Email Spam	        Spam email content, infected attachments, and phishing emails. Note: Limit comments to only relevent information (instead of log dumps) and be sure to remove PII if you want to remain anonymous.
-# 12	Blog Spam	        CMS blog comment spam.
-# 13	VPN IP	            Conjunctive category.
-# 14	Port Scan	        Scanning for open ports and vulnerable services.
-# 15	Hacking	
-# 16	SQL Injection	    Attempts at SQL injection.
-# 17	Spoofing	        Email sender spoofing.
-# 18	Brute-Force	        Credential brute-force attacks on webpage logins and services like SSH, FTP, SIP, SMTP, RDP, etc. This category is seperate from DDoS attacks.
-# 19	Bad Web Bot	        Webpage scraping (for email addresses, content, etc) and crawlers that do not honor robots.txt. Excessive requests and user agent spoofing can also be reported here.
-# 20	Exploited Host	    Host is likely infected with malware and being used for other attacks or to host malicious content. The host owner may not be aware of the compromise. This category is often used in combination with other attack categories.
-# 21	Web App Attack	    Attempts to probe for or exploit installed web applications such as a CMS like WordPress/Drupal, e-commerce solutions, forum software, phpMyAdmin and various other software plugins/solutions.
-# 22	SSH	                Secure Shell (SSH) abuse. Use this category in combination with more specific categories.
-# 23	IoT Targeted	    Abuse was targeted at an "Internet of Things" type device. Include information about what type of device was targeted in the comments.
-
-import json
+import socket
+import atexit
+import dothat.lcd as lcd
+import dothat.backlight as backlight
+import threading
+import sys
 import requests
-import urllib
+import paramiko
 
-abuseIPDBKey=""
-reported_ips = []
+from requests import get
+from datetime import datetime
 
-def reportIP(ip_address, abuse_types, comment):
-    global abuseIPDBKey, reported_ips
+ENABLE_LOGGING = False
 
-    if ip_address in reported_ips:
-        return
+paramiko.util.log_to_file("/tmp/paramiko.log")
 
-    data = {"ip": ip_address, "categories": abuse_types, "comment": comment}
-    headers = {"Key": abuseIPDBKey, "Accept": "application/json"}
+curr_daily_reports = 0
+max_daily_reports = 5000
 
-    resp = requests.post("https://api.abuseipdb.com/api/v2/report", data=data, headers=headers)
-    
-    reported_ips += ip_address
+abuse_IPDB_key=""
 
-    with open("reported_ips.txt", "a") as ipfile:
-        ipfile.write(ip_address + '\n')    
-    
-    print(resp.text)
-    print ("IP ADDRESS REPORTED")
-        
+ip = get('https://api.ipify.org').text
+
+# Local IP for the honeypot to listen on (TCP)
+LHOST = '0.0.0.0'
+
+# Banner displayed when connecting to the honeypot
+BANNER = 'Ubuntu 14.04 LTS\nlogin: '
+
+# Socket timeout in seconds
+TIMEOUT = 10
+
+THREADS = {}
+listener = {}
+QUIT_REQUEST = False
+PROTOCOLS={
+    "21": "FTP",
+    "22": "SSH",
+    "23": "Telnet",
+    "80": "HTTP",
+    "443": "HTTPS"
+    }
+
+ssh_host_key = paramiko.RSAKey(filename="test_rsa.key")    
 
 def main():
-    global abuseIPDBKey, reported_ips
+    global PROTOCOLS
 
-    with open("reported_ips.txt", "r") as ipfile:
-        reported = ipfile.readlines()
-        for line in reported:
-            reported_ips.append(line.replace('\n',''))
-            print(reported_ips)
+    startup()
+    
+    for proto in PROTOCOLS:
+        THREADS[str(proto)] = threading.Thread(target=start_honeypot, args=(int(proto),PROTOCOLS[str(proto)])) 
+        THREADS[str(proto)].start()
+
+def startup():
+    global abuse_IPDB_key
+
+    atexit.register(exit_handler)
+
+    lcd.clear()
+    lcd.set_cursor_position(0,0)
+    lcd.write("MrLukeKR's")
+    lcd.set_cursor_position(0,1)
+    lcd.write("HoneyPotter")
+
+    for x in range(360):
+        backlight.sweep((360.0 - x) / 360.0)
+
+    set_backlight(0,0,255)
+    lcd.clear()
+    lcd.set_cursor_position(0,0)
+    lcd.write("Listening on:")
+    lcd.set_cursor_position(0,1)
+    lcd.write(ip)
+
+    print '[*] Honeypot starting on ' + LHOST + ' (Public IP: ' + ip + ')'
 
     with open("reportAbuseAPIKey.txt", "r") as apikey:
-        abuseIPDBKey = apikey.read().replace('\n','')
+        abuse_IPDB_key = apikey.read().replace('\n', '')        
 
-    with open("../opencanary.log1", "r") as infile:
-        lines = infile.readlines()
+def start_honeypot(port, service_desc):
+    print '[*] Service listener starting on port ' + str(port) + ' (' + service_desc + ')'
+    listener[str(port)] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener[str(port)].setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener[str(port)].bind((LHOST, port))
+    listener[str(port)].listen(100)
 
-        for line in lines:
-            data = json.loads(line)
-            logtype = data['logtype']
-            report_ip=""
-            report_type=""
-            report_comment=""
-                
-            if logtype == 4002: # SSH login attempt
-                print("SSH LOGIN ATTEMPT:")
-                print("\tUsername: " + data['logdata']['USERNAME'])
-                print("\tPassword: " + data['logdata']['PASSWORD'])
-                print("\tIP Address: " + data['src_host'])
-                
-                report_ip = data['src_host']
-                report_type=(18,22)
+    while not QUIT_REQUEST:
+        insock, address = listener[str(port)].accept()
+        insock.settimeout(TIMEOUT)
+        conn = threading.Thread(target=handle_connection, args=(port, address[0], address[1], insock))
+        conn.start()
 
-                report_comment += "UTC Time: " + data['utc_time'] + '\n'
-                report_comment += "Username: " + data['logdata']['USERNAME'] + '\n'
-                report_comment += "Password: " + data['logdata']['PASSWORD'] + '\n'
-                report_comment += "Local SSH: " + data['logdata']['LOCALVERSION'] + '\n'
-                report_comment += "Remote SSH: " + data['logdata']['REMOTEVERSION']
-                
-            if (report_ip != "" and report_ip not in reported_ips):
-                reportIP(report_ip, report_type, report_comment)
+def handle_connection(lport, rhost, rport, insock):
+    global PROTOCOLS, ssh_host_key
 
-if __name__ == "__main__":
-    main()
+    print '[+] Honeypot connection from ' + rhost + ':' + str(rport) + ' on port ' + str(lport)
+
+    set_backlight(255,255,0)
+    lcd.clear()
+    lcd.set_cursor_position(0,0)
+    lcd.write("Connection from:")
+    lcd.set_cursor_position(0,1)
+    lcd.write(rhost)
+
+    username=''
+    password=''
+
+    report_comment = "UTC Time: " + str(datetime.utcnow()) + "\n"
+    report_comment += "Source: " + rhost + ":" + str(rport) + "\n"
+    report_comment += "Protocol: " + PROTOCOLS[str(lport)]  + "\n"
+
+    try:
+        #insock.send(BANNER)
+        #data = insock.recv(1024)
+   
+        lcd.set_cursor_position(0,2)
+        lcd.write(PROTOCOLS[str(lport)])
+    
+        set_backlight(255,0,0)
+
+        abuse_cat=(14,15)
+
+        username = ''
+        password = ''
+
+        if lport==22:
+            abuse_cat = (18,22)
+            ssh_sess = paramiko.Transport(insock)
+            ssh_sess.set_gss_host(socket.getfqdn(""))
+            try:
+                ssh_sess.load_server_moduli()
+            except:
+                print '[x] Failed to load moduli'
+            ssh_sess.add_server_key(ssh_host_key)
+            server_handler = SSHServerHandler()
+            try:
+                ssh_sess.start_server(server=server_handler)
+            except:
+                print '[x] SSH negotiation failed'
+                ssh_sess.close()
+            else:
+                try:
+                    chan = ssh_sess.accept(20)
+                    if chan is None:
+                        print("[?] No channel")
+                except:
+                    print '[x] Could not open channel'
+                finally:
+                    if chan is not None:
+                        chan.close()
+
+            username = server_handler.user_attempt
+            password = server_handler.pass_attempt
+            print '[>]\tUser: ' + username + "\tPass: " + password
+            
+            ssh_sess.close()
+
+        elif lport==21:
+            abuse_cat = (18,5)
+
+        if username != '':
+            report_comment += "Username: " + username + '\n'
+        if password != '':
+            report_comment += "Password: " + password + '\n'    
+
+        if rhost == ip:
+            print '[-] Ignoring -- This is from our public IP address'
+        elif rhost.split('.')[0] == "192" and rhost.split('.')[1] == "168" and rhost.split('.')[2] == "1" :
+            print '[-] Ignoring -- This is from our local network'
+        else:
+            report_ip(rhost, abuse_cat, report_comment)
+    except socket.error, e:
+        print('[x] Error: ' + str(e))
+    finally:
+        insock.close()
+
+    sys.stdout.flush()
+
+def log_debug(text):
+    global ENABLE_LOGGING
+
+    if not ENABLE_LOGGING:
+        return
+
+    print text
+
+def report_ip(ip_addr, abuse_types, comment):
+    global abuse_IPDB_key, reported_IPs, curr_daily_reports, max_daily_reports
+
+    data = { "ip": ip_addr, "categories": ','.join(map(str, abuse_types)), "comment": comment }
+    headers = { "Key": abuse_IPDB_key, "Accept": "application/json" }
+
+    resp = requests.post("https://api.abuseipdb.com/api/v2/report", data=data, headers=headers)
+    print("[!] Reported IP " + ip_addr)
+
+    set_backlight(0,255,0)
+    lcd.clear()
+    lcd.set_cursor_position(0,0)
+    lcd.write("Reported IP:")
+    lcd.set_cursor_position(0,1)
+    lcd.write(ip_addr)
+
+    curr_daily_reports += 1
+    backlight.set_graph(curr_daily_reports / max_daily_reports)
+    # TODO: Add to IP address db
+    # TODO: Reset count at 1AM UK time
+    # TODO: Load count from DB if restarting
+
+def set_backlight(r,g,b):
+    backlight.left_rgb(r, g, b)
+    backlight.mid_rgb(r, g, b)
+    backlight.right_rgb(r, g, b)
+
+def exit_handler():
+    global PROTOCOLS, THREADS
+    
+    print '\n[*] Honeypot is shutting down!'
+
+    for proto in PROTOCOLS:
+        print '\n[*] Port '+ str(proto) +' is shutting down!'
+        THREADS[proto].join()
+        listener[proto].close()
+    
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        QUIT_REQUEST = True
+        
+        for proto in PROTOCOLS:
+            print '\n[*] Port '+ str(proto) +' is shutting down!'
+            listener[proto].close()
+            THREADS[proto].join()
+        
+
+class SSHServerHandler (paramiko.ServerInterface):
+    user_attempt = ''
+    pass_attempt = ''
+    
+    def __init__(self):
+        log_debug('[?] __init__()')
+        self.event = threading.Event()
+
+    def check_channel_request(self, kind, chanid):
+        log_debug('[?] check_channel_request()')
+        if kind == 'session':
+            return paramiko.OPEN_SUCCEEDED
+
+    def check_auth_password(self, username, password):
+        log_debug('[?] check_auth_password()')
+
+        self.user_attempt = username
+        self.pass_attempt = password
+
+        return paramiko.AUTH_SUCCEEDED
+
+    def get_allowed_auths(self, username):
+        log_debug('[?] get_allowed_auths()')
+        return 'password'
