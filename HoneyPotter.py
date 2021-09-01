@@ -6,13 +6,29 @@ import threading
 import sys
 import requests
 import paramiko
+import sqlite3
 
+from threading import Lock
 from requests import get
-from datetime import datetime
+from datetime import datetime, date
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    OKMAGENTA = '\033[95m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 ENABLE_LOGGING = False
 
 paramiko.util.log_to_file("/tmp/paramiko.log")
+con = sqlite3.connect('honeypotter.db')
+db = con.cursor()
 
 curr_daily_reports = 0
 max_daily_reports = 5000
@@ -30,6 +46,9 @@ BANNER = 'Ubuntu 14.04 LTS\nlogin: '
 # Socket timeout in seconds
 TIMEOUT = 10
 
+# Backlight timeout in seconds
+BACKLIGHT_TIMEOUT = 10
+
 THREADS = {}
 listener = {}
 QUIT_REQUEST = False
@@ -37,9 +56,15 @@ PROTOCOLS={
     "21": "FTP",
     "22": "SSH",
     "23": "Telnet",
+    "25": "SMTP",
     "80": "HTTP",
-    "443": "HTTPS"
+    "443": "HTTPS",
+    "3306": "MySQL",
+    "5900": "VNC",
+    "6379": "Redis"
     }
+
+mutex = Lock()
 
 ssh_host_key = paramiko.RSAKey(filename="test_rsa.key")    
 
@@ -47,7 +72,12 @@ def main():
     global PROTOCOLS
 
     startup()
-    
+
+    create_db()
+    get_current_api_usage()
+
+    update_graph()
+
     for proto in PROTOCOLS:
         THREADS[str(proto)] = threading.Thread(target=start_honeypot, args=(int(proto),PROTOCOLS[str(proto)])) 
         THREADS[str(proto)].start()
@@ -73,13 +103,13 @@ def startup():
     lcd.set_cursor_position(0,1)
     lcd.write(ip)
 
-    print '[*] Honeypot starting on ' + LHOST + ' (Public IP: ' + ip + ')'
+    print '[*] ' + bcolors.OKBLUE + 'Honeypot starting on ' + LHOST + ' (Public IP: ' + ip + ')' + bcolors.ENDC
 
     with open("reportAbuseAPIKey.txt", "r") as apikey:
         abuse_IPDB_key = apikey.read().replace('\n', '')        
 
 def start_honeypot(port, service_desc):
-    print '[*] Service listener starting on port ' + str(port) + ' (' + service_desc + ')'
+    print '[*] ' + bcolors.OKBLUE + 'Service listener starting on port ' + str(port) + ' (' + service_desc + ')' + bcolors.ENDC
     listener[str(port)] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener[str(port)].setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener[str(port)].bind((LHOST, port))
@@ -94,7 +124,7 @@ def start_honeypot(port, service_desc):
 def handle_connection(lport, rhost, rport, insock):
     global PROTOCOLS, ssh_host_key
 
-    print '[+] Honeypot connection from ' + rhost + ':' + str(rport) + ' on port ' + str(lport)
+    print '[+] ' + bcolors.OKCYAN + 'Honeypot connection from ' + rhost + ':' + str(rport) + ' on port ' + str(lport) + bcolors.ENDC
 
     set_backlight(255,255,0)
     lcd.clear()
@@ -125,7 +155,6 @@ def handle_connection(lport, rhost, rport, insock):
         password = ''
 
         if lport==22:
-            abuse_cat = (18,22)
             ssh_sess = paramiko.Transport(insock)
             ssh_sess.set_gss_host(socket.getfqdn(""))
             try:
@@ -152,6 +181,12 @@ def handle_connection(lport, rhost, rport, insock):
 
             username = server_handler.user_attempt
             password = server_handler.pass_attempt
+
+            if username != '':
+                abuse_cat = (18,22)
+            else:
+                abuse_cat = (22)
+
             print '[>]\tUser: ' + username + "\tPass: " + password
             
             ssh_sess.close()
@@ -165,13 +200,13 @@ def handle_connection(lport, rhost, rport, insock):
             report_comment += "Password: " + password + '\n'    
 
         if rhost == ip:
-            print '[-] Ignoring -- This is from our public IP address'
+            print '[-] ' + bcolors.WARNING + 'Ignoring -- This is from our public IP address' + bcolors.ENDC
         elif rhost.split('.')[0] == "192" and rhost.split('.')[1] == "168" and rhost.split('.')[2] == "1" :
-            print '[-] Ignoring -- This is from our local network'
+            print '[-] ' + bcolors.WARNING + 'Ignoring -- This is from our local network' + bcolors.ENDC
         else:
             report_ip(rhost, abuse_cat, report_comment)
     except socket.error, e:
-        print('[x] Error: ' + str(e))
+        print('[x] ' + bcolors.FAIL + 'Error: ' + str(e) + bcolors.ENDC)
     finally:
         insock.close()
 
@@ -188,24 +223,56 @@ def log_debug(text):
 def report_ip(ip_addr, abuse_types, comment):
     global abuse_IPDB_key, reported_IPs, curr_daily_reports, max_daily_reports
 
-    data = { "ip": ip_addr, "categories": ','.join(map(str, abuse_types)), "comment": comment }
+    if type(abuse_types) is tuple:
+        data = { "ip": ip_addr, "categories": ','.join(map(str, abuse_types)), "comment": comment }
+    else:
+        data = { "ip": ip_addr, "categories": str(abuse_types), "comment": comment }
     headers = { "Key": abuse_IPDB_key, "Accept": "application/json" }
 
-    resp = requests.post("https://api.abuseipdb.com/api/v2/report", data=data, headers=headers)
-    print("[!] Reported IP " + ip_addr)
+    db.execute("SELECT count FROM ip_addresses WHERE address='" + ip_addr + "';")
+    res = db.fetchall()
 
-    set_backlight(0,255,0)
+    ip_logged = res[0] > 0
+
     lcd.clear()
     lcd.set_cursor_position(0,0)
-    lcd.write("Reported IP:")
-    lcd.set_cursor_position(0,1)
-    lcd.write(ip_addr)
 
+    if curr_daily_reports < max_daily_reports:
+        set_backlight(0,255,0)
+
+        resp = requests.post("https://api.abuseipdb.com/api/v2/report", data=data, headers=headers)
+        print("[!] " + bcolors.OKGREEN + "Reported IP " + ip_addr + bcolors.ENDC)
+
+        lcd.write("Reported IP:")
+        lcd.set_cursor_position(0,1)
+        lcd.write(ip_addr)
+
+        db.execute("INSERT OR IGNORE INTO api VALUES ('" + str(date.today()) + "', 0);")
+        db.execute("UPDATE api SET count = count + 1 WHERE date='" + str(date.today()) + "';")
+
+        if ip_logged:
+            db.execute("UPDATE ip_addresses SET count = count + 1 WHERE address='" + ip_addr + "';") 
+        else:
+            db.execute("INSERT INTO ip_addresses VALUES('" + ip_addr + "', 1);")
+    else:
+        print("[!] " + bcolors.OKMAGENTA + "Queued IP " + ip_addr + bcolors.ENDC)
+
+        set_backlight(255,0,255)
+
+        lcd.write("Queued IP:")
+        lcd.set_cursor_position(0,1)
+        lcd.write(ip_addr)
+
+    mutex.acquire()
     curr_daily_reports += 1
-    backlight.set_graph(curr_daily_reports / max_daily_reports)
+    update_graph()
+    mutex.release()
+    
     # TODO: Add to IP address db
     # TODO: Reset count at 1AM UK time
-    # TODO: Load count from DB if restarting
+
+def update_graph():
+    backlight.set_graph(float(curr_daily_reports) / float(max_daily_reports))
 
 def set_backlight(r,g,b):
     backlight.left_rgb(r, g, b)
@@ -222,6 +289,20 @@ def exit_handler():
         THREADS[proto].join()
         listener[proto].close()
     
+
+def create_db():
+    db.execute('CREATE TABLE IF NOT EXISTS api (date TEXT PRIMARY KEY, count INTEGER);')
+    db.execute('CREATE TABLE IF NOT EXISTS ip_addresses (address TEXT PRIMARY KEY, reports INTEGER);')
+    db.execute('CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT, reported INTEGER, abuse_types TEXT, comment TEXT);')
+
+def get_current_api_usage():
+    global curr_daily_reports
+
+    db.execute("SELECT count FROM api WHERE date='" + str(date.today()) + "';")
+
+    rows = db.fetchall()
+    if len(rows) > 0:
+        curr_daily_reports = rows[0]
 
 if __name__ == '__main__':
     try:
