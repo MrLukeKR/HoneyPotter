@@ -27,7 +27,7 @@ class bcolors:
 ENABLE_LOGGING = False
 
 paramiko.util.log_to_file("/tmp/paramiko.log")
-con = sqlite3.connect('honeypotter.db')
+con = sqlite3.connect('honeypotter.db', check_same_thread=False)
 db = con.cursor()
 
 curr_daily_reports = 0
@@ -170,14 +170,29 @@ def handle_connection(lport, rhost, rport, insock):
                 ssh_sess.close()
             else:
                 try:
-                    chan = ssh_sess.accept(20)
+                    chan = ssh_sess.accept(10)
                     if chan is None:
                         print("[?] No channel")
                 except:
                     print '[x] Could not open channel'
                 finally:
                     if chan is not None:
-                        chan.close()
+                        chan.settimeout(10)
+                        if ssh_sess.remote_mac != '':
+                            mac = "MAC Address: " + ssh_sess.remote_mac
+                            print '[?]\t' + mac
+                            report_comment += mac
+
+                        server_handler.event.wait(10)
+                        if not server_handler.event.is_set():
+                            print '[X] Client never asked for a shell'
+                            chan.close()
+                        else:
+                            chan.send("Welcome to Ubuntu 18.04.4 LTS (GNU/Linux 4.15.0-128-generic x86_64)\r\n\r\n")
+                            run = False
+                            while run:
+                                chand.send("$ ")
+                            chan.close()
 
             username = server_handler.user_attempt
             password = server_handler.pass_attempt
