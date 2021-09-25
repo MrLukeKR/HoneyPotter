@@ -25,7 +25,15 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-ENABLE_LOGGING = True
+ENABLE_LOGGING = False
+
+exec_req = ""
+
+UP_KEY = '\x1b[A'.encode()
+DOWN_KEY = '\x1b[B'.encode()
+RIGHT_KEY = '\x1b[C'.encode()
+LEFT_KEY = '\x1b[D'.encode()
+BACK_KEY = '\x7f'.encode()
 
 SSH_BANNER = "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.1"
 
@@ -134,20 +142,38 @@ def start_honeypot(port, service_desc):
         conn = threading.Thread(target=handle_connection, args=(port, address[0], address[1], insock))
         conn.start()
 
+def handle_cmd(cmd, chan):
+
+    print('[<] Attacker: ' + cmd)
+
+    response = ""
+    if cmd.startswith("ls"):
+        response = "users.txt"
+    elif cmd.startswith("pwd"):
+        response = "/root"
+
+    if response != '':
+        print('[>] Server: ' + response)
+        response = response + "\r\n"
+    chan.send(response)
+
 def handle_connection(lport, rhost, rport, insock):
-    global PROTOCOLS, ssh_host_key
+    global PROTOCOLS, ssh_host_key, exec_req
 
     print '[+] ' + bcolors.OKCYAN + 'Honeypot connection from ' + rhost + ':' + str(rport) + ' on port ' + str(lport) + bcolors.ENDC
 
+    mutex.acquire()
     set_backlight(255,255,0)
     lcd.clear()
     lcd.set_cursor_position(0,0)
     lcd.write("Connection from:")
     lcd.set_cursor_position(0,1)
     lcd.write(rhost)
+    mutex.release()
 
     username=''
     password=''
+    commands = []
 
     report_comment = "UTC Time: " + str(datetime.utcnow()) + "\n"
     report_comment += "Source: " + rhost + ":" + str(rport) + "\n"
@@ -157,8 +183,10 @@ def handle_connection(lport, rhost, rport, insock):
         #insock.send(BANNER)
         #data = insock.recv(1024)
    
+        mutex.acquire()
         lcd.set_cursor_position(0,2)
         lcd.write(PROTOCOLS[str(lport)])
+        mutex.release()
     
         set_backlight(255,0,0)
 
@@ -191,31 +219,55 @@ def handle_connection(lport, rhost, rport, insock):
                         print("[?] No channel")
                     else:
                         chan.settimeout(10)
-                        if ssh_sess.remote_mac != '':
-                            mac = "MAC Address: " + ssh_sess.remote_mac
-                            print '[?]\t' + mac
-                            report_comment += mac
-
                         server_handler.event.wait(10)
+
                         if not server_handler.event.is_set():
-                            print '[X] Client never asked for a shell'
+                            print '[X] Client never asked for an interactive shell'
+                            if(exec_req != ""):
+                                report_comment += "Attacker Interaction: " + exec_req
+                                print '[<] Attacker: ' + exec_req
+                                exec_req = ""
                             chan.close()
                         else:
                             chan.send("Welcome to Ubuntu 18.04.4 LTS (GNU/Linux 4.15.0-128-generic x86_64)\r\n\r\n")
-                            run = False
+                            run = True
                             while run:
                                 chan.send("$ ")
+                                command = ""
+                                while not command.endswith("\r"):
+                                    transport = chan.recv(1024)
+                                    print("[?]\tReceived:",transport)
+                                    # Echo input to psuedo-simulate a basic terminal
+                                    if(
+                                        transport != UP_KEY
+                                        and transport != DOWN_KEY
+                                        and transport != LEFT_KEY
+                                        and transport != RIGHT_KEY
+                                        and transport != BACK_KEY
+                                    ):
+                                        chan.send(transport)
+                                        command += transport.decode("utf-8")
+                
+                                chan.send("\r\n")
+                                command = command.rstrip()
+                                commands.append(command)
+
+                                if command == "exit":
+                                    print("[?] Connection closed (via exit command)")
+                                    run = False
+                                else:
+                                    handle_cmd(command, chan, client_ip)
                             chan.close()
 
             username = server_handler.user_attempt
             password = server_handler.pass_attempt
 
+            print '[<]\tUser: ' + username + "\tPass: " + password
+
             if username != '':
                 abuse_cat = (18,22)
             else:
                 abuse_cat = (22)
-
-            print '[>]\tUser: ' + username + "\tPass: " + password
             
             ssh_sess.close()
 
@@ -226,6 +278,11 @@ def handle_connection(lport, rhost, rport, insock):
             report_comment += "Username: " + username + '\n'
         if password != '':
             report_comment += "Password: " + password + '\n'    
+
+        if len(commands) > 0:
+            report_comment += "Attacker Interactions:\n"
+            for command in commands:
+                report_comment += "\t" + command + "\n"
 
         if rhost == ip:
             print '[-] ' + bcolors.WARNING + 'Ignoring -- This is from our public IP address' + bcolors.ENDC
@@ -381,9 +438,12 @@ class SSHServerHandler (paramiko.ServerInterface):
         return True
 
     def check_channel_exec_request(self, channel, command):
+        global exec_req
         log_debug('[?] check_channel_exec_request()')
 
         command_text = str(command.decode("utf-8"))
 
-        print('[>] Client sent command: ' + command)
+        log_debug('[<] Attacker sent command: ' + command)
+
+        exec_req = command
         return True
