@@ -7,6 +7,7 @@ import sys
 import requests
 import paramiko
 import sqlite3
+from signal import signal, SIGINT
 
 from threading import Lock
 from requests import get
@@ -24,7 +25,9 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-ENABLE_LOGGING = False
+ENABLE_LOGGING = True
+
+SSH_BANNER = "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.1"
 
 paramiko.util.log_to_file("/tmp/paramiko.log")
 con = sqlite3.connect('honeypotter.db', check_same_thread=False)
@@ -68,6 +71,14 @@ mutex = Lock()
 
 ssh_host_key = paramiko.RSAKey(filename="test_rsa.key")    
 
+def shutdown(signal_received, frame):
+    QUIT_REQUEST = True
+        
+    for proto in PROTOCOLS:
+        print '\n[*] Port '+ str(proto) +' is shutting down!'
+        listener[proto].close()
+        THREADS[proto].join()
+
 def main():
     global PROTOCOLS
 
@@ -77,6 +88,8 @@ def main():
     get_current_api_usage()
 
     update_graph()
+
+    signal(SIGINT, shutdown)
 
     for proto in PROTOCOLS:
         THREADS[str(proto)] = threading.Thread(target=start_honeypot, args=(int(proto),PROTOCOLS[str(proto)])) 
@@ -113,7 +126,7 @@ def start_honeypot(port, service_desc):
     listener[str(port)] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener[str(port)].setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener[str(port)].bind((LHOST, port))
-    listener[str(port)].listen(100)
+    listener[str(port)].listen(10)
 
     while not QUIT_REQUEST:
         insock, address = listener[str(port)].accept()
@@ -156,27 +169,27 @@ def handle_connection(lport, rhost, rport, insock):
 
         if lport==22:
             ssh_sess = paramiko.Transport(insock)
-            ssh_sess.set_gss_host(socket.getfqdn(""))
+
             try:
                 ssh_sess.load_server_moduli()
             except:
                 print '[x] Failed to load moduli'
             ssh_sess.add_server_key(ssh_host_key)
-            server_handler = SSHServerHandler()
+            ssh_sess.local_version = SSH_BANNER
+            server_handler = SSHServerHandler(rhost)
             try:
                 ssh_sess.start_server(server=server_handler)
             except:
                 print '[x] SSH negotiation failed'
-                ssh_sess.close()
             else:
                 try:
                     chan = ssh_sess.accept(10)
-                    if chan is None:
-                        print("[?] No channel")
                 except:
                     print '[x] Could not open channel'
-                finally:
-                    if chan is not None:
+                else:
+                    if chan is None:
+                        print("[?] No channel")
+                    else:
                         chan.settimeout(10)
                         if ssh_sess.remote_mac != '':
                             mac = "MAC Address: " + ssh_sess.remote_mac
@@ -191,7 +204,7 @@ def handle_connection(lport, rhost, rport, insock):
                             chan.send("Welcome to Ubuntu 18.04.4 LTS (GNU/Linux 4.15.0-128-generic x86_64)\r\n\r\n")
                             run = False
                             while run:
-                                chand.send("$ ")
+                                chan.send("$ ")
                             chan.close()
 
             username = server_handler.user_attempt
@@ -244,10 +257,10 @@ def report_ip(ip_addr, abuse_types, comment):
         data = { "ip": ip_addr, "categories": str(abuse_types), "comment": comment }
     headers = { "Key": abuse_IPDB_key, "Accept": "application/json" }
 
-    db.execute("SELECT count FROM ip_addresses WHERE address='" + ip_addr + "';")
+    db.execute("SELECT reports FROM ip_addresses WHERE address='" + ip_addr + "';")
     res = db.fetchall()
 
-    ip_logged = res[0] > 0
+    ip_logged = len(res) > 0 and res[0] > 0
 
     lcd.clear()
     lcd.set_cursor_position(0,0)
@@ -266,7 +279,7 @@ def report_ip(ip_addr, abuse_types, comment):
         db.execute("UPDATE api SET count = count + 1 WHERE date='" + str(date.today()) + "';")
 
         if ip_logged:
-            db.execute("UPDATE ip_addresses SET count = count + 1 WHERE address='" + ip_addr + "';") 
+            db.execute("UPDATE ip_addresses SET reports = reports + 1 WHERE address='" + ip_addr + "';") 
         else:
             db.execute("INSERT INTO ip_addresses VALUES('" + ip_addr + "', 1);")
     else:
@@ -323,26 +336,17 @@ if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        QUIT_REQUEST = True
-        
-        for proto in PROTOCOLS:
-            print '\n[*] Port '+ str(proto) +' is shutting down!'
-            listener[proto].close()
-            THREADS[proto].join()
-        
+        shutdown()    
 
 class SSHServerHandler (paramiko.ServerInterface):
     user_attempt = ''
     pass_attempt = ''
+    client_ip = ''
     
-    def __init__(self):
+    def __init__(self, client_ip):
         log_debug('[?] __init__()')
+        self.client_ip = client_ip
         self.event = threading.Event()
-
-    def check_channel_request(self, kind, chanid):
-        log_debug('[?] check_channel_request()')
-        if kind == 'session':
-            return paramiko.OPEN_SUCCEEDED
 
     def check_auth_password(self, username, password):
         log_debug('[?] check_auth_password()')
@@ -354,4 +358,32 @@ class SSHServerHandler (paramiko.ServerInterface):
 
     def get_allowed_auths(self, username):
         log_debug('[?] get_allowed_auths()')
-        return 'password'
+        return 'publickey,password,none'
+
+    def check_auth_publickey(self, username, key):
+        fingerprint = u(hexlify(key.get_fingerprint()))
+        log_debug('[?] client public key ({}): username: {}, key name: {}, md5 fingerprint: {}, base64: {}, bits: {}'.format(
+                    self.client_ip, username, key.get_name(), fingerprint, key.get_base64(), key.get_bits()))
+        return paramiko.AUTH_PARTIALLY_SUCCESSFUL
+
+    def check_channel_request(self, kind, chanid):
+        log_debug('[?] check_channel_request()')
+        if kind == 'session':
+            return paramiko.OPEN_SUCCEEDED
+
+    def check_channel_shell_request(self, channel):
+        log_debug('[?] check_channel_shell_request()')
+        self.event.set()
+        return True
+
+    def check_channel_pty_request(self, channel, term, width, height, pixelwidth, pixelheight, modes):
+        log_debug('[?] check_channel_pty_request()')
+        return True
+
+    def check_channel_exec_request(self, channel, command):
+        log_debug('[?] check_channel_exec_request()')
+
+        command_text = str(command.decode("utf-8"))
+
+        print('[>] Client sent command: ' + command)
+        return True
