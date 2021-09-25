@@ -47,7 +47,7 @@ LHOST = '0.0.0.0'
 BANNER = 'Ubuntu 14.04 LTS\nlogin: '
 
 # Socket timeout in seconds
-TIMEOUT = 10
+TIMEOUT = 30
 
 # Backlight timeout in seconds
 BACKLIGHT_TIMEOUT = 10
@@ -126,7 +126,7 @@ def start_honeypot(port, service_desc):
     listener[str(port)] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener[str(port)].setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener[str(port)].bind((LHOST, port))
-    listener[str(port)].listen(10)
+    listener[str(port)].listen(100)
 
     while not QUIT_REQUEST:
         insock, address = listener[str(port)].accept()
@@ -354,7 +354,7 @@ class SSHServerHandler (paramiko.ServerInterface):
         self.user_attempt = username
         self.pass_attempt = password
 
-        return paramiko.AUTH_SUCCEEDED
+        return paramiko.AUTH_SUCCESSFUL
 
     def get_allowed_auths(self, username):
         log_debug('[?] get_allowed_auths()')
