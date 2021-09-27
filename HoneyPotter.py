@@ -8,11 +8,14 @@ import requests
 import paramiko
 import sqlite3
 import datetime
+import re
 
 from signal import signal, SIGINT
 from threading import Lock
 from requests import get
 from datetime import datetime, date
+from binascii import hexlify
+from paramiko.py3compat import u, decodebytes
 
 class bcolors:
     HEADER = '\033[95m'
@@ -70,6 +73,10 @@ PROTOCOLS={
     "23": "Telnet",
     "25": "SMTP",
     "80": "HTTP",
+    "110": "POP3",
+    "115": "SFTP",
+    "194": "IRC",
+    "389": "LDAP",
     "443": "HTTPS",
     "3306": "MySQL",
     "5900": "VNC",
@@ -154,49 +161,64 @@ def start_honeypot(port, service_desc):
         conn.start()
 
 
-def handle_cmd(cmd, chan):
-    print('[<] Attacker: ' + cmd)
-
+def handle_cmd(rec_cmd, chan):
+    found_items = []
+    multiple_cmds = map(str.strip, rec_cmd.split(';'))
     response = ""
-    used_sudo = cmd.startswith("sudo")
-    cmd.replace("sudo", "")
+    curr_dir = "/root"
 
-    if cmd.startswith("ls"):
-        response = "bankdetails.txt"
-    elif cmd.startswith("pwd"):
-        response = "/root"
-    elif cmd.startswith("whoami"):
-        response = "root"
-    elif cmd.startswith("hive-passwd"):
-        response = "Password changed successfully"
-    elif cmd.startswith("uname -a"):
-        current_time = datetime.now()
-        formatted_date = current_time.strftime("%a %b %d %H:%M:%S BST %Y")
-        response = "Linux desktop 5.10.60+ #1449 " + formatted_date + " armv6l GNU/Linux"
+    print('[<] Attacker: ' + rec_cmd)
 
-    if response != '':
-        print('[>] Server: ' + response)
-        response = response + "\r\n"
+    for cmd in multiple_cmds:
+        used_sudo = cmd.startswith("sudo")
+        cmd = cmd.replace("sudo", "")
+
+        curr_response = None
+
+        if cmd.startswith("ls"):
+            curr_response = "bankdetails.txt"
+        elif cmd.startswith("pwd"):
+            curr_response = curr_dir
+        elif cmd.startswith("whoami"):
+            curr_response = "root"
+        elif cmd.startswith("hive-passwd"):
+            curr_response = "Password changed successfully"
+        elif cmd.startswith("uname -a"):
+            current_time = datetime.now()
+            formatted_date = current_time.strftime("%a %b %d %H:%M:%S BST %Y")
+            curr_response = "Linux desktop 5.10.60+ #1449 " + formatted_date + " armv6l GNU/Linux"
+        elif cmd.startswith("cat /etc/issue"):
+            curr_response = "Ubuntu Linux"
+        elif cmd.startswith("curl") or cmd.startswith("wget"):
+            malware_link = re.search("(?P<url>https?://[^\s]+)", cmd).group("url")
+            print('[!] ' + bcolors.WARNING + 'Possible Malware: ' + malware_link + bcolors.ENDC)
+            malware_pair = ("malware", malware_link)
+            found_items.append(malware_pair)
+        elif cmd.startswith("cd"):
+            curr_dir = cmd.split("cd")[1]
+
+        if curr_response is not None:
+            print('[>] Server: ' + curr_response)
+            response += curr_response + "\r\n"
     chan.send(response)
+
+    return found_items
 
 
 def handle_ssh(insock, rhost):
-    global exec_req
+    global exec_req, ssh_rsa_host_key, ssh_ed25519_host_key
     username = ""
     password = ""
     commands = []
+    extra_info = []
 
-    try:
-        ssh_sess = paramiko.Transport(insock)
-    except:
-        print('[x] Failed to create transport')
-        return username, password, commands
+    ssh_sess = paramiko.Transport(insock)
 
     try:
         ssh_sess.load_server_moduli()
     except:
-        print('[x] Failed to load moduli')
-        return username, password, commands
+        print('[x] ' + bcolors.FAIL + 'Failed to load moduli' + bcolors.ENDC)
+        return username, password, commands, extra_info
 
     ssh_sess.add_server_key(ssh_rsa_host_key)
     ssh_sess.add_server_key(ssh_ed25519_host_key)
@@ -207,35 +229,29 @@ def handle_ssh(insock, rhost):
     try:
         ssh_sess.start_server(server=server_handler)
     except:
-        print('[x] SSH negotiation failed')
-        return username, password, commands
+        print('[x] ' + bcolors.FAIL + 'SSH negotiation failed' + bcolors.ENDC)
+        return username, password, commands, extra_info
 
     try:
         chan = ssh_sess.accept(10)
-    except:
-        print('[x] Could not open channel')
-        return username, password, commands
+    finally:
+        if chan is None:
+            print('[x] ' + bcolors.FAIL + 'Could not open channel' + bcolors.ENDC)
+            return username, password, commands, extra_info
 
     username = server_handler.user_attempt
     password = server_handler.pass_attempt
 
-    if chan is None:
-        print('[x] Could not open channel')
-        return username, password, commands
-
     chan.settimeout(10)
-    server_handler.event.wait(10)
-
-    exec_req_processed=False
+    server_handler.event.wait(3)
 
     if exec_req != "":
         commands.append(exec_req)
-        print('[<] Attacker: ' + exec_req)
+        extra_info += handle_cmd(exec_req, chan)
         exec_req = ""
-        exec_req_processed=True
 
-    if not server_handler.event.is_set() and not exec_req_processed:
-        print('[X] Client never asked for an interactive shell')
+    if not server_handler.event.is_set():
+        print('[x] ' + bcolors.FAIL + 'Client never asked for an interactive shell'+ bcolors.ENDC)
         chan.close()
     else:
         chan.send("Welcome to Ubuntu 18.04.4 LTS (GNU/Linux 4.15.0-128-generic x86_64)\r\n\r\n")
@@ -245,7 +261,7 @@ def handle_ssh(insock, rhost):
             command = ""
             while not command.endswith("\r"):
                 transport = chan.recv(1024)
-                print("[?] Received: " + transport)
+                log_debug("[?] Received: " + transport)
                 # Echo input to psuedo-simulate a basic terminal
                 if(
                     transport != UP_KEY
@@ -265,16 +281,17 @@ def handle_ssh(insock, rhost):
                 print("[?] Connection closed (via exit command)")
                 run = False
             else:
-                handle_cmd(command, chan)
+                extra_info.append(handle_cmd(command, chan))
+                print(extra_info)
         chan.close()
 
     ssh_sess.close()
 
-    return username, password, commands
+    return username, password, commands, extra_info
 
 
 def handle_connection(lport, rhost, rport, insock):
-    global PROTOCOLS, ssh_rsa_host_key, ssh_ed25519_host_key, exec_req
+    global PROTOCOLS
 
     print('[+] ' + bcolors.OKCYAN + 'Honeypot connection from ' + rhost + ':' + str(rport) + ' on port ' + str(lport) + bcolors.ENDC)
 
@@ -287,14 +304,9 @@ def handle_connection(lport, rhost, rport, insock):
     lcd.write(rhost)
     mutex.release()
 
-    username=''
-    password=''
-    commands = []
-
     report_comment = "UTC Time: " + str(datetime.utcnow()) + "\n"
     report_comment += "Source: " + rhost + ":" + str(rport) + "\n"
-    report_comment += "Protocol: " + PROTOCOLS[str(lport)]  + "\n"
-
+    report_comment += "Protocol: " + PROTOCOLS[str(lport)] + "\n"
 
     #insock.send(BANNER)
     #data = insock.recv(1024)
@@ -310,9 +322,11 @@ def handle_connection(lport, rhost, rport, insock):
 
     username = ''
     password = ''
+    commands = []
+    extra_info = []
 
     if lport==22:
-        username, password, commands = handle_ssh(insock, rhost)
+        username, password, commands, extra_info = handle_ssh(insock, rhost)
 
         if username != '':
             abuse_cat = (18,22)
@@ -331,6 +345,13 @@ def handle_connection(lport, rhost, rport, insock):
         report_comment += "Attacker Interactions:\n"
         for command in commands:
             report_comment += "\t" + command + "\n"
+
+    if len(extra_info) > 0:
+        report_comment += "Extra Information:\n"
+
+        for info in extra_info:
+            if info[0] == "malware":
+                report_comment += "- Possible malware: " + info[1]
 
     if rhost == ip:
         print('[-] ' + bcolors.WARNING + 'Ignoring -- This is from our public IP address' + bcolors.ENDC + " (" + report_comment.replace("\n", "\t") + ")")
@@ -372,7 +393,7 @@ def report_ip(ip_addr, abuse_types, comment):
         set_backlight(0,255,0)
 
         resp = requests.post("https://api.abuseipdb.com/api/v2/report", data=data, headers=headers)
-        print("[!] " + bcolors.OKGREEN + "Reported IP " + ip_addr + bcolors.ENDC)
+        print("[!] " + bcolors.OKGREEN + "Reported IP " + ip_addr + bcolors.ENDC + " (" + comment.replace('\n', ' ').strip() + ")")
 
         lcd.write("Reported IP:")
         lcd.set_cursor_position(0,1)
@@ -467,7 +488,7 @@ class SSHServerHandler (paramiko.ServerInterface):
         fingerprint = u(hexlify(key.get_fingerprint()))
         log_debug('[?] client public key ({}): username: {}, key name: {}, md5 fingerprint: {}, base64: {}, bits: {}'.format(
                     self.client_ip, username, key.get_name(), fingerprint, key.get_base64(), key.get_bits()))
-        return paramiko.AUTH_PARTIALLY_SUCCESSFUL
+        return paramiko.AUTH_SUCCESSFUL
 
     def check_channel_request(self, kind, chanid):
         log_debug('[?] check_channel_request()')
@@ -489,7 +510,7 @@ class SSHServerHandler (paramiko.ServerInterface):
 
         command_text = str(command.decode("utf-8"))
 
-        log_debug('[<] Attacker sent command: ' + command)
+        log_debug('[<] Attacker sent command: ' + command_text)
 
-        exec_req = command
+        exec_req = command_text
         return True
