@@ -7,8 +7,9 @@ import sys
 import requests
 import paramiko
 import sqlite3
-from signal import signal, SIGINT
+import datetime
 
+from signal import signal, SIGINT
 from threading import Lock
 from requests import get
 from datetime import datetime, date
@@ -72,20 +73,26 @@ PROTOCOLS={
     "443": "HTTPS",
     "3306": "MySQL",
     "5900": "VNC",
-    "6379": "Redis"
+    "6379": "Redis",
+    "8080": "HTTP"
     }
 
 mutex = Lock()
 
-ssh_host_key = paramiko.RSAKey(filename="test_rsa.key")    
+ssh_rsa_host_key = paramiko.RSAKey(filename="rsa.key")
+ssh_ed25519_host_key = paramiko.Ed25519Key(filename="ed25519.key")
+
 
 def shutdown(signal_received, frame):
+    global QUIT_REQUEST
+
     QUIT_REQUEST = True
-        
+
     for proto in PROTOCOLS:
-        print '\n[*] Port '+ str(proto) +' is shutting down!'
+        print('\n[*] Port '+ str(proto) +' is shutting down!')
         listener[proto].close()
         THREADS[proto].join()
+
 
 def main():
     global PROTOCOLS
@@ -100,8 +107,9 @@ def main():
     signal(SIGINT, shutdown)
 
     for proto in PROTOCOLS:
-        THREADS[str(proto)] = threading.Thread(target=start_honeypot, args=(int(proto),PROTOCOLS[str(proto)])) 
+        THREADS[str(proto)] = threading.Thread(target=start_honeypot, args=(int(proto),PROTOCOLS[str(proto)]))
         THREADS[str(proto)].start()
+
 
 def startup():
     global abuse_IPDB_key
@@ -124,13 +132,16 @@ def startup():
     lcd.set_cursor_position(0,1)
     lcd.write(ip)
 
-    print '[*] ' + bcolors.OKBLUE + 'Honeypot starting on ' + LHOST + ' (Public IP: ' + ip + ')' + bcolors.ENDC
+    print('[*] ' + bcolors.OKBLUE + 'Honeypot starting on ' + LHOST + ' (Public IP: ' + ip + ')' + bcolors.ENDC)
 
     with open("reportAbuseAPIKey.txt", "r") as apikey:
-        abuse_IPDB_key = apikey.read().replace('\n', '')        
+        abuse_IPDB_key = apikey.read().replace('\n', '')
+
 
 def start_honeypot(port, service_desc):
-    print '[*] ' + bcolors.OKBLUE + 'Service listener starting on port ' + str(port) + ' (' + service_desc + ')' + bcolors.ENDC
+    global QUIT_REQUEST
+
+    print('[*] ' + bcolors.OKBLUE + 'Service listener starting on port ' + str(port) + ' (' + service_desc + ')' + bcolors.ENDC)
     listener[str(port)] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener[str(port)].setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener[str(port)].bind((LHOST, port))
@@ -142,25 +153,130 @@ def start_honeypot(port, service_desc):
         conn = threading.Thread(target=handle_connection, args=(port, address[0], address[1], insock))
         conn.start()
 
-def handle_cmd(cmd, chan):
 
+def handle_cmd(cmd, chan):
     print('[<] Attacker: ' + cmd)
 
     response = ""
+    used_sudo = cmd.startswith("sudo")
+    cmd.replace("sudo", "")
+
     if cmd.startswith("ls"):
-        response = "users.txt"
+        response = "bankdetails.txt"
     elif cmd.startswith("pwd"):
         response = "/root"
+    elif cmd.startswith("whoami"):
+        response = "root"
+    elif cmd.startswith("hive-passwd"):
+        response = "Password changed successfully"
+    elif cmd.startswith("uname -a"):
+        current_time = datetime.now()
+        formatted_date = current_time.strftime("%a %b %d %H:%M:%S BST %Y")
+        response = "Linux desktop 5.10.60+ #1449 " + formatted_date + " armv6l GNU/Linux"
 
     if response != '':
         print('[>] Server: ' + response)
         response = response + "\r\n"
     chan.send(response)
 
-def handle_connection(lport, rhost, rport, insock):
-    global PROTOCOLS, ssh_host_key, exec_req
 
-    print '[+] ' + bcolors.OKCYAN + 'Honeypot connection from ' + rhost + ':' + str(rport) + ' on port ' + str(lport) + bcolors.ENDC
+def handle_ssh(insock, rhost):
+    global exec_req
+    username = ""
+    password = ""
+    commands = []
+
+    try:
+        ssh_sess = paramiko.Transport(insock)
+    except:
+        print('[x] Failed to create transport')
+        return username, password, commands
+
+    try:
+        ssh_sess.load_server_moduli()
+    except:
+        print('[x] Failed to load moduli')
+        return username, password, commands
+
+    ssh_sess.add_server_key(ssh_rsa_host_key)
+    ssh_sess.add_server_key(ssh_ed25519_host_key)
+    ssh_sess.local_version = SSH_BANNER
+    server_handler = SSHServerHandler(rhost)
+    chan = None
+
+    try:
+        ssh_sess.start_server(server=server_handler)
+    except:
+        print('[x] SSH negotiation failed')
+        return username, password, commands
+
+    try:
+        chan = ssh_sess.accept(10)
+    except:
+        print('[x] Could not open channel')
+        return username, password, commands
+
+    username = server_handler.user_attempt
+    password = server_handler.pass_attempt
+
+    if chan is None:
+        print('[x] Could not open channel')
+        return username, password, commands
+
+    chan.settimeout(10)
+    server_handler.event.wait(10)
+
+    exec_req_processed=False
+
+    if exec_req != "":
+        commands.append(exec_req)
+        print('[<] Attacker: ' + exec_req)
+        exec_req = ""
+        exec_req_processed=True
+
+    if not server_handler.event.is_set() and not exec_req_processed:
+        print('[X] Client never asked for an interactive shell')
+        chan.close()
+    else:
+        chan.send("Welcome to Ubuntu 18.04.4 LTS (GNU/Linux 4.15.0-128-generic x86_64)\r\n\r\n")
+        run = True
+        while run:
+            chan.send("$ ")
+            command = ""
+            while not command.endswith("\r"):
+                transport = chan.recv(1024)
+                print("[?] Received: " + transport)
+                # Echo input to psuedo-simulate a basic terminal
+                if(
+                    transport != UP_KEY
+                    and transport != DOWN_KEY
+                    and transport != LEFT_KEY
+                    and transport != RIGHT_KEY
+                    and transport != BACK_KEY
+                ):
+                    chan.send(transport)
+                    command += transport.decode("utf-8")
+
+            chan.send("\r\n")
+            command = command.rstrip()
+            commands.append(command)
+
+            if command == "exit":
+                print("[?] Connection closed (via exit command)")
+                run = False
+            else:
+                handle_cmd(command, chan)
+        chan.close()
+
+    ssh_sess.close()
+
+    return username, password, commands
+
+
+def handle_connection(lport, rhost, rport, insock):
+    global PROTOCOLS, ssh_rsa_host_key, ssh_ed25519_host_key, exec_req
+
+    print('[+] ' + bcolors.OKCYAN + 'Honeypot connection from ' + rhost + ':' + str(rport) + ' on port ' + str(lport) + bcolors.ENDC)
 
     mutex.acquire()
     set_backlight(255,255,0)
@@ -179,121 +295,51 @@ def handle_connection(lport, rhost, rport, insock):
     report_comment += "Source: " + rhost + ":" + str(rport) + "\n"
     report_comment += "Protocol: " + PROTOCOLS[str(lport)]  + "\n"
 
-    try:
-        #insock.send(BANNER)
-        #data = insock.recv(1024)
-   
-        mutex.acquire()
-        lcd.set_cursor_position(0,2)
-        lcd.write(PROTOCOLS[str(lport)])
-        mutex.release()
-    
-        set_backlight(255,0,0)
 
-        abuse_cat=(14,15)
+    #insock.send(BANNER)
+    #data = insock.recv(1024)
 
-        username = ''
-        password = ''
+    mutex.acquire()
+    lcd.set_cursor_position(0,2)
+    lcd.write(PROTOCOLS[str(lport)])
+    mutex.release()
 
-        if lport==22:
-            ssh_sess = paramiko.Transport(insock)
+    set_backlight(255,0,0)
 
-            try:
-                ssh_sess.load_server_moduli()
-            except:
-                print '[x] Failed to load moduli'
-            ssh_sess.add_server_key(ssh_host_key)
-            ssh_sess.local_version = SSH_BANNER
-            server_handler = SSHServerHandler(rhost)
-            try:
-                ssh_sess.start_server(server=server_handler)
-            except:
-                print '[x] SSH negotiation failed'
-            else:
-                try:
-                    chan = ssh_sess.accept(10)
-                except:
-                    print '[x] Could not open channel'
-                else:
-                    if chan is None:
-                        print("[?] No channel")
-                    else:
-                        chan.settimeout(10)
-                        server_handler.event.wait(10)
+    abuse_cat=(14,15)
 
-                        if not server_handler.event.is_set():
-                            print '[X] Client never asked for an interactive shell'
-                            if(exec_req != ""):
-                                report_comment += "Attacker Interaction: " + exec_req
-                                print '[<] Attacker: ' + exec_req
-                                exec_req = ""
-                            chan.close()
-                        else:
-                            chan.send("Welcome to Ubuntu 18.04.4 LTS (GNU/Linux 4.15.0-128-generic x86_64)\r\n\r\n")
-                            run = True
-                            while run:
-                                chan.send("$ ")
-                                command = ""
-                                while not command.endswith("\r"):
-                                    transport = chan.recv(1024)
-                                    print("[?]\tReceived:",transport)
-                                    # Echo input to psuedo-simulate a basic terminal
-                                    if(
-                                        transport != UP_KEY
-                                        and transport != DOWN_KEY
-                                        and transport != LEFT_KEY
-                                        and transport != RIGHT_KEY
-                                        and transport != BACK_KEY
-                                    ):
-                                        chan.send(transport)
-                                        command += transport.decode("utf-8")
-                
-                                chan.send("\r\n")
-                                command = command.rstrip()
-                                commands.append(command)
+    username = ''
+    password = ''
 
-                                if command == "exit":
-                                    print("[?] Connection closed (via exit command)")
-                                    run = False
-                                else:
-                                    handle_cmd(command, chan, client_ip)
-                            chan.close()
-
-            username = server_handler.user_attempt
-            password = server_handler.pass_attempt
-
-            print '[<]\tUser: ' + username + "\tPass: " + password
-
-            if username != '':
-                abuse_cat = (18,22)
-            else:
-                abuse_cat = (22)
-            
-            ssh_sess.close()
-
-        elif lport==21:
-            abuse_cat = (18,5)
+    if lport==22:
+        username, password, commands = handle_ssh(insock, rhost)
 
         if username != '':
-            report_comment += "Username: " + username + '\n'
-        if password != '':
-            report_comment += "Password: " + password + '\n'    
-
-        if len(commands) > 0:
-            report_comment += "Attacker Interactions:\n"
-            for command in commands:
-                report_comment += "\t" + command + "\n"
-
-        if rhost == ip:
-            print '[-] ' + bcolors.WARNING + 'Ignoring -- This is from our public IP address' + bcolors.ENDC
-        elif rhost.split('.')[0] == "192" and rhost.split('.')[1] == "168" and rhost.split('.')[2] == "1" :
-            print '[-] ' + bcolors.WARNING + 'Ignoring -- This is from our local network' + bcolors.ENDC
+            abuse_cat = (18,22)
         else:
-            report_ip(rhost, abuse_cat, report_comment)
-    except socket.error, e:
-        print('[x] ' + bcolors.FAIL + 'Error: ' + str(e) + bcolors.ENDC)
-    finally:
-        insock.close()
+            abuse_cat = (22)
+
+    elif lport==21:
+        abuse_cat = (18,5)
+
+    if username != '':
+        report_comment += "Username: " + username + '\n'
+    if password != '':
+        report_comment += "Password: " + password + '\n'
+
+    if len(commands) > 0:
+        report_comment += "Attacker Interactions:\n"
+        for command in commands:
+            report_comment += "\t" + command + "\n"
+
+    if rhost == ip:
+        print('[-] ' + bcolors.WARNING + 'Ignoring -- This is from our public IP address' + bcolors.ENDC + " (" + report_comment.replace("\n", "\t") + ")")
+    elif rhost.split('.')[0] == "192" and rhost.split('.')[1] == "168" and rhost.split('.')[2] == "1" :
+        print('[-] ' + bcolors.WARNING + 'Ignoring -- This is from our local network' + bcolors.ENDC + " (" + report_comment.replace("\n", "\t") + ")")
+    else:
+        report_ip(rhost, abuse_cat, report_comment)
+
+    insock.close()
 
     sys.stdout.flush()
 
@@ -303,7 +349,7 @@ def log_debug(text):
     if not ENABLE_LOGGING:
         return
 
-    print text
+    print(text)
 
 def report_ip(ip_addr, abuse_types, comment):
     global abuse_IPDB_key, reported_IPs, curr_daily_reports, max_daily_reports
@@ -336,7 +382,7 @@ def report_ip(ip_addr, abuse_types, comment):
         db.execute("UPDATE api SET count = count + 1 WHERE date='" + str(date.today()) + "';")
 
         if ip_logged:
-            db.execute("UPDATE ip_addresses SET reports = reports + 1 WHERE address='" + ip_addr + "';") 
+            db.execute("UPDATE ip_addresses SET reports = reports + 1 WHERE address='" + ip_addr + "';")
         else:
             db.execute("INSERT INTO ip_addresses VALUES('" + ip_addr + "', 1);")
     else:
@@ -352,7 +398,7 @@ def report_ip(ip_addr, abuse_types, comment):
     curr_daily_reports += 1
     update_graph()
     mutex.release()
-    
+
     # TODO: Add to IP address db
     # TODO: Reset count at 1AM UK time
 
@@ -366,14 +412,14 @@ def set_backlight(r,g,b):
 
 def exit_handler():
     global PROTOCOLS, THREADS
-    
-    print '\n[*] Honeypot is shutting down!'
+
+    print('\n[*] Honeypot is shutting down!')
 
     for proto in PROTOCOLS:
-        print '\n[*] Port '+ str(proto) +' is shutting down!'
+        print('\n[*] Port '+ str(proto) +' is shutting down!')
         THREADS[proto].join()
         listener[proto].close()
-    
+
 
 def create_db():
     db.execute('CREATE TABLE IF NOT EXISTS api (date TEXT PRIMARY KEY, count INTEGER);')
@@ -393,13 +439,13 @@ if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        shutdown()    
+        shutdown()
 
 class SSHServerHandler (paramiko.ServerInterface):
     user_attempt = ''
     pass_attempt = ''
     client_ip = ''
-    
+
     def __init__(self, client_ip):
         log_debug('[?] __init__()')
         self.client_ip = client_ip
